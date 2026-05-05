@@ -1,0 +1,3 @@
+Files needed by RVC that go in this directory:
+- hubert_base.pt
+- hubert_inputs.pth

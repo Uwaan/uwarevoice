@@ -1,0 +1,6 @@
+python-socketio[asyncio_client]>=5.10
+aiohttp>=3.9
+sounddevice>=0.4.6
+numpy>=1.26
+psutil>=5.9
+nvidia-ml-py>=12.560

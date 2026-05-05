@@ -1,0 +1,5 @@
+Files needed by RVC that go in this directory:
+- your_rvc_model.pth
+- your_rvc_model.idx
+
+**NOTE: at this time, u_revoice.py (in its DEFAULT_SETTINGS) must be edited to point to these files directly; automatic selection is not fully implemented yet.

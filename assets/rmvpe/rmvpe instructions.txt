@@ -1,0 +1,3 @@
+Files needed by RVC that go in this directory:
+- rmvpe.pt
+- rmvpe.onnx
