@@ -1,3 +1,13 @@
+# Project-specific (uwarevoice)
+lib/
+!infer/lib/
+*.pt
+*.pth
+*.idx
+*.onnx
+*.jit
+*.safetensors
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -14,7 +24,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
