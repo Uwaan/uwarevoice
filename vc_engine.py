@@ -1,5 +1,6 @@
 """VCEngine — synchronous audio processing pipeline."""
 import logging
+from pathlib import Path
 
 import librosa
 import numpy as np
@@ -8,11 +9,28 @@ import torchaudio.transforms as audio_transform
 import fairseq
 from tools.torchgate import TorchGate
 from infer.lib import rtrvc
+#from infer.lib import rtchatterbox
 from configs.config import Config
 from multiprocessing import Queue
 from time import perf_counter
 from typing import Tuple
 
+
+_MODELS_DIR = Path(__file__).parent / "models"
+
+
+def resolve_model_paths(model_name: str) -> Tuple[str, str]:
+    """Return (pth_path, idx_path) for models/{model_name}/. idx_path may be
+    empty if no .index file is present. Raises FileNotFoundError if the
+    directory is missing or contains no .pth file."""
+    model_dir = _MODELS_DIR / model_name
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
+    pth_files = sorted(model_dir.glob("*.pth"))
+    if not pth_files:
+        raise FileNotFoundError(f"No .pth file found in {model_dir}")
+    idx_files = sorted(model_dir.glob("*.index"))
+    return str(pth_files[0]), (str(idx_files[0]) if idx_files else "")
 
 
 # From RVC v2
@@ -119,13 +137,10 @@ class VCEngine:
         if settings.get("output_device", "client") == "client":
             self.output_gain = 1.0
 
-        # RVC-specific settings. Empty path strings fall back to conventional
-        # names under the model directory so a .pth / .index pair dropped in
-        # is picked up automatically.
-        self.rvc_pth_filename = (settings.get("rvc_pth_filename")
-                                 or self.model_filename + "/model.pth") # TODO: fix
-        self.rvc_idx_filename = (settings.get("rvc_idx_filename")
-                                 or self.model_filename + "/model.index") # TODO: fix
+        # Resolve .pth / .index paths from the model directory itself —
+        # the layout is fixed (one .pth and optional .index per model dir),
+        # so there's no reason to round-trip these through client settings.
+        self.rvc_pth_filename, self.rvc_idx_filename = resolve_model_paths(self.model_name)
         self.rvc_index_rate = settings.get("rvc_index_rate", 0.0)
         self.num_cpus = settings.get("num_cpus", 4)
         self.f0_method = settings.get("f0_method", "rmvpe")
@@ -170,6 +185,19 @@ class VCEngine:
                 self.config,
                 prev_rvc,
             )
+
+        #self.vc = rtchatterbox.Chatterbox(
+        #        self.input_pitch_shift,
+        #        self.input_formant_shift,
+        #        self.rvc_pth_filename,
+        #        self.rvc_idx_filename,
+        #        self.rvc_index_rate,
+        #        self.num_cpus,
+        #        self.inp_q,
+        #        self.opt_q,
+        #        self.config,
+        #        prev_rvc,
+        #    )
 
         # Determine I/O channels? Both should be mono for
         # inference & should be mono when using 'client' as
@@ -646,6 +674,34 @@ class VCEngine:
             else:
                 logging.warning("(vc_engine): Engine stop/restart required for changes take effect.")
 
+
+    def load_model(self, settings: dict) -> None:
+        """Swap to the model named by settings["model_name"]. The .pth/.index
+        paths are resolved from the model directory by configure()."""
+        was_active = self.vc_active
+        if was_active:
+            self.hot_update = True
+            self.stop_vc()
+
+        # Drop the stale RVC so its model weights / CUDA tensors are released
+        # before we instantiate the replacement. Without this, prev_rvc inside
+        # start_vc would keep the old weights resident alongside the new ones.
+        self.vc = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.configure(settings)
+
+        if was_active:
+            self.start_vc()
+            self.hot_update = False
+
+
+    def set_compute_device(self, device_name: str):
+        # Only call with conversion stopped - changes take effect on
+        # start_vc
+        self.infer_device = device_name
+        self._settings["inference_device"] = device_name
 
     def hot_reload(self, key, value):
         if key in self._settings:

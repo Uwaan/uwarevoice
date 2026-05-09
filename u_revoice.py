@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import time
@@ -16,9 +17,10 @@ import aiohttp.web
 import numpy as np
 import psutil
 import socketio
+import torch
 
 from server_audio import ServerAudioIO
-from vc_engine import VCEngine
+from vc_engine import VCEngine, resolve_model_paths
 
 # ---------------------------------------------------------------------------
 # GPU / NVML setup
@@ -58,8 +60,6 @@ DEFAULT_SETTINGS = {
     "inference_device": "cuda:0",
     "input_device": "client",
     "output_device": "client",
-    "rvc_pth_filename": "./models/defaultvoice/default.pth",
-    "rvc_idx_filename": "./models/defaultvoice/default.idx",
     "rvc_index_rate": 0.0,
     "num_cpus": 4,  # TODO: Remove? This needs to be passed to RVC core but the only use is for "harvest" F0 scraping
     "f0_method": "rmvpe",
@@ -88,7 +88,10 @@ def _load_settings(client_id: str) -> dict:
         try:
             with open(path) as f:
                 on_disk = json.load(f)
-            merged.update(on_disk)
+            # Drop keys that are no longer part of DEFAULT_SETTINGS so old
+            # entries (e.g. removed rvc_pth_filename/rvc_idx_filename) don't
+            # leak back into _settings.
+            merged.update({k: v for k, v in on_disk.items() if k in DEFAULT_SETTINGS})
         except Exception as e:
             logging.warning(f"Could not load {path}: {e}; using defaults.")
     else:
@@ -127,6 +130,44 @@ _active_client_id: Optional[str] = None
 
 QUEUE_OVERLOAD_THRESHOLD = 8
 
+# Accepted compute-device strings: a pytorch backend name, optionally with a
+# device index (e.g. "cpu", "cuda", "cuda:0", "mps", "xpu:1", "vulkan").
+_COMPUTE_DEVICE_RE = re.compile(r"^(cpu|cuda|mps|xpu|vulkan)(:\d+)?$")
+
+
+def _list_compute_devices() -> list:
+    """Enumerate compute backends pytorch reports as available on this host."""
+    devices = ["cpu"]
+    try:
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            if count <= 1:
+                devices.append("cuda")
+            else:
+                devices.extend(f"cuda:{i}" for i in range(count))
+    except Exception:
+        pass
+    try:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            devices.append("mps")
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            count = torch.xpu.device_count()
+            if count <= 1:
+                devices.append("xpu")
+            else:
+                devices.extend(f"xpu:{i}" for i in range(count))
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
+            devices.append("vulkan")
+    except Exception:
+        pass
+    return devices
+
 # ---------------------------------------------------------------------------
 # Socket.IO + aiohttp app
 # ---------------------------------------------------------------------------
@@ -158,7 +199,7 @@ def _get_system_stats() -> dict:
     vm = psutil.virtual_memory()
     return {
         "cpu_percent": psutil.cpu_percent(),
-        "mem_used_mib": vm.used // (1024 *f 1024),
+        "mem_used_mib": vm.used // (1024 * 1024),
         "mem_total_mib": vm.total // (1024 * 1024),
     }
 
@@ -187,8 +228,12 @@ async def _stop_server() -> None:
                 pass
     _processing_task = None
     _status_task = None
-    if _settings.get("input_device", "client") == "client" or _settings.get("output_device", "client") == "client":
-        _audio_io.stop_all()
+
+    # Do we need to test this, even?
+    # if _settings.get("input_device", "client") == "client" or _settings.get("output_device", "client") == "client":
+    #     _audio_io.stop_all()
+    _audio_io.stop_all()
+
     if _engine.vc_active:
         _engine.stop_vc()
 
@@ -392,13 +437,44 @@ async def on_update_param(sid, data):
             else:
                 if _server_running:
                     await _stop_server()
-                    await _emit_message(1, f"Param '{key}' changed to '{value}'. Please restart conversion for changes to take effect.", sid=sid)
+                    await _emit_message(1, f"Param '{key}' changed to '{value}'. Please restart "
+                        + "conversion for changes to take effect.", sid=sid)
                     await sio.emit("SERVER_STOPPED", None, to=sid)
 
         else:
             logging.info(f"Received invalid parameter to update: {key}")
             await _emit_message(2, f"Received invalid parameter to update: {key}", sid=sid)
     # await sio.emit("SET_PARAMS", dict(_settings), to=sid)
+
+
+@sio.on("GET_COMPUTE")
+async def on_get_compute_device(sid, data=None):
+    await sio.emit("LIST_COMPUTE", {"devices": _list_compute_devices()}, to=sid)
+
+
+@sio.on("SET_COMPUTE")
+async def on_update_compute_device(sid, data):
+    if _active_sid != sid or _active_client_id is None:
+        await _emit_message(2, "Client must register itself via GET_PARAMS before changing "
+            + "the compute device.", sid=sid)
+        return
+
+    device = (data or {}).get("infer_device", "")
+    if not isinstance(device, str) or not _COMPUTE_DEVICE_RE.match(device):
+        await _emit_message(2, f"Invalid compute device: {device!r}", sid=sid)
+        return
+
+    if _server_running:
+        await _stop_server()
+        await _emit_message(1, f"Compute device changed to '{device}'. "
+            + "Conversion stopped; please restart for changes to take effect.", sid=sid)
+        await sio.emit("SERVER_STOPPED", None, to=sid)
+
+    try:
+        _engine.set_compute_device(device)
+        _settings["inference_device"] = device
+    except Exception as e:
+        await _emit_message(2, f"Error setting compute device: {type(e).__name__}: {e}", sid=sid)
 
 
 @sio.on("MODEL_UNLOAD")
@@ -409,20 +485,37 @@ async def on_model_unload(sid, data=None):
 @sio.on("MODEL_LOAD")
 async def on_model_load(sid, data):
     model_name = data.get("model_name", _settings.get("model_name", "defaultvoice"))
-    model_dir = Path(__file__).parent / "models" / model_name
-    if not model_dir.is_dir():
-        await sio.emit("MODEL_LOAD_FAIL", {"model_name": model_name, "reason": "Directory not found"}, to=sid)
+
+    # Validate the model directory up front so we can return a clean error
+    # without spinning up the engine.
+    try:
+        pth_path, idx_path = resolve_model_paths(model_name)
+    except FileNotFoundError as e:
+        await sio.emit("MODEL_LOAD_FAIL", {"model_name": model_name, "reason": str(e)}, to=sid)
         return
+
     _settings["model_name"] = model_name
-    # TODO: Actually load model using _engine, check valid files + success
-    #if _engine.load_model(model_name):
+    logging.info(f"Loading model '{model_name}': pth={pth_path}, idx={idx_path or '(none)'}")
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(_executor, _engine.load_model, dict(_settings))
+    except Exception as e:
+        logging.exception("load_model failed")
+        await sio.emit(
+            "MODEL_LOAD_FAIL",
+            {"model_name": model_name, "reason": f"{type(e).__name__}: {e}"},
+            to=sid,
+        )
+        return
+
     await sio.emit("MODEL_LOAD_SUCCESS", {"model_name": model_name}, to=sid)
 
 
 @sio.on("SERVER_SAVE")
 async def on_server_save(sid, data=None):
     if _active_sid != sid or _active_client_id is None:
-        await _emit_message(2, "Client must register a client_id via GET_PARAMS before saving settings.", sid=sid)
+        await _emit_message(2, "Please register using GET_PARAMS before saving settings.", sid=sid)
         return
     _save_settings(_active_client_id)
     await _emit_message(0, f"Settings saved for client '{_active_client_id}'.", sid=sid)
@@ -441,7 +534,7 @@ async def on_server_start(sid, data=None):
     global _server_running, _audio_queue, _processing_task, _status_task
 
     if _active_sid != sid or _active_client_id is None:
-        await _emit_message(2, "Client must register a client_id via GET_PARAMS before starting the server.", sid=sid)
+        await _emit_message(2, "You must register via GET_PARAMS before starting the server.", sid=sid)
         return
 
     if _server_running:
@@ -455,13 +548,14 @@ async def on_server_start(sid, data=None):
     _processing_task = asyncio.create_task(_audio_processing_loop(origin_sid=sid))
     _status_task = asyncio.create_task(_status_push_loop())
 
-    # Before any start, make sure configuration is current
-    _engine.configure(_settings)
-    _engine.start_vc()
-
-    # Determine input sample rate
+    # Resolve hardware sample rates first so the engine is configured
+    # against the rates we'll actually be running at — start_vc bakes
+    # input_sr/output_sr into chunk_size_samples and the resamplers, so
+    # any post-start correction wouldn't take effect.
     input_device = _settings.get("input_device", "client")
     output_device = _settings.get("output_device", "client")
+    input_sr = _settings.get("input_sr", 0)
+    output_sr = _settings.get("output_sr", 0)
 
     if input_device != "client":
         try:
@@ -470,8 +564,8 @@ async def on_server_start(sid, data=None):
                 await _emit_message(2, "Invalid sample rate on server input; correcting", sid=sid)
                 _settings["input_sr"] = input_sr
         except Exception as e:
-            _server_running = False
             await _emit_message(2, f"Failed to get intput device sample rate: {e}", sid=sid)
+            await _stop_server()
             return
 
     if output_device != "client":
@@ -481,11 +575,23 @@ async def on_server_start(sid, data=None):
                 await _emit_message(2, "Invalid sample rate on server output; correcting", sid=sid)
                 _settings["output_sr"] = output_sr
         except Exception as e:
-            _server_running = False
             await _emit_message(2, f"Failed to get output device sample rate: {e}", sid=sid)
+            await _stop_server()
             return
 
     _engine.configure(_settings)
+    try:
+        _engine.start_vc()
+    except Exception as e:
+        logging.exception("start_vc failed during SERVER_START")
+        model_name = _settings.get("model_name", "defaultvoice")
+        await sio.emit(
+            "MODEL_LOAD_FAIL",
+            {"model_name": model_name, "reason": f"{type(e).__name__}: {e}"},
+            to=sid,
+        )
+        await _stop_server()
+        return
 
     # Start hardware input if needed
     if input_device != "client":
@@ -495,9 +601,8 @@ async def on_server_start(sid, data=None):
                 input_device, input_sr, _engine.chunk_size_samples, _on_hardware_chunk, loop
             )
         except Exception as e:
-            _server_running = False
-            _audio_io.stop_all()
             await _emit_message(2, f"Failed to open input device: {e}", sid=sid)
+            await _stop_server()
             return
 
     # Start hardware output if needed
@@ -505,9 +610,8 @@ async def on_server_start(sid, data=None):
         try:
             _audio_io.start_output(output_device, output_sr)
         except Exception as e:
-            _server_running = False
-            _audio_io.stop_all()
             await _emit_message(2, f"Failed to open output device: {e}", sid=sid)
+            await _stop_server()
             return
 
     logging.info("Conversion engine started.")
