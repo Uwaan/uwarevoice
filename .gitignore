@@ -7,6 +7,9 @@ lib/
 *.onnx
 *.jit
 *.safetensors
+.idea
+# Temp until further chatterbox tests
+chatterbox/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
