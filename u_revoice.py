@@ -670,14 +670,42 @@ app.on_shutdown.append(_on_shutdown)
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _attempt_inherit_socket() -> Optional[socket.socket]:
+    # sd_listen_fds protocol: systemd passes listening FDs starting at FD 3
+    # and sets LISTEN_PID to the PID that should consume them.
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return None
+    try:
+        fd_count = int(os.environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return None
+    if fd_count < 1:
+        return None
+    SD_LISTEN_FDS_START = 3
+    sock = socket.socket(fileno=SD_LISTEN_FDS_START)
+    # Prevent inherited FDs from leaking into any child processes we spawn.
+    for k in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
+        os.environ.pop(k, None)
+    return sock
+
+
 def main():
     parser = argparse.ArgumentParser(description="Uwarevoice server")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8965)
+    parser.add_argument("--loglevel", type=int, default=1)
     args = parser.parse_args()
 
+    log_level = logging.DEBUG
+    if args.loglevel == 1:
+        log_level = logging.INFO
+    elif args.loglevel == 2:
+        log_level = logging.WARNING
+    elif args.loglevel >= 3:
+        log_level = logging.ERROR
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         force=True,     # Can't find where this is getting set earlier in the
                         # chain, but logging.INFO isn't working without it
@@ -694,7 +722,13 @@ def main():
             "inference_device is 'cuda' but no CUDA GPU detected!"
         )
 
-    aiohttp.web.run_app(app, host=args.host, port=args.port)
+    inherited = _attempt_inherit_socket()
+    if inherited is not None:
+        logging.warning(f"Starting listener on received socket fd=3 ({inherited.getsockname()})")
+        aiohttp.web.run_app(app, sock=inherited)
+    else:
+        logging.warning(f"Starting listener on address {args.host}, port {args.port}")
+        aiohttp.web.run_app(app, host=args.host, port=args.port)
 
 if __name__ == "__main__":
     main()
