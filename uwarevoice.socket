@@ -1,0 +1,16 @@
+# This creates a systemd listener that will live on a
+# particular socket, then start a service (uwarevoice)
+# when traffic is received and pass the open socket
+# over to that service once it is started.
+
+[Unit]
+Description=Uwarevoice Socket
+
+[Socket]
+# Default port for uwarevoice - listens on TCP port
+ListenStream=8965
+Accept=false
+
+[Install]
+WantedBy=sockets.target
+

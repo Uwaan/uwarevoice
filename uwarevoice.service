@@ -1,0 +1,23 @@
+# This is the corresponding systemd service that will
+# run the uwarevoice server as a daemon when traffic
+# is received on the uwarevoice.socket.
+
+[Unit]
+Description=Uwarevoice Service
+Requires=uwarevoice.socket
+
+[Service]
+# This is the script that will run to start the daemon.
+# EDIT THIS LINE to point to your local installation.
+ExecStart=/opt/uwavoice/start_server.sh --loglevel=3
+
+# This will restart if python crashes, but not restart
+# when you send a REQUEST_EXIT
+Restart=on-failure
+
+# You can change the user that it runs as
+#User=uwavc
+#Group=uwavc
+
+[Install]
+WantedBy=multi-user.target
